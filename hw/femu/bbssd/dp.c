@@ -275,7 +275,6 @@ void dp_init_block_pools(struct ssd *ssd)
                 for (int blk = 0; blk < plp->nblks; blk++) {
                     struct nand_block *block = &plp->blk[blk];
                     dp_pool_entry *entry = &bp->entries[idx++];
-                    int rc;
 
                     entry->blk = block;
                     entry->base.ppa = 0;
@@ -292,16 +291,12 @@ void dp_init_block_pools(struct ssd *ssd)
 
                     if (g_random_boolean()) {
                         entry->in_hot = true;
-                        rc = pqueue_insert(bp->hot_pool, entry);
-                        ftl_assert(rc == 0);
-                        rc = pqueue_insert(bp->hot_pool_eff, entry);
-                        ftl_assert(rc == 0);
+                        pqueue_insert(bp->hot_pool, entry);
+                        ftl_assert(pqueue_insert(bp->hot_pool_eff, entry) == 0);
                     } else {
                         entry->in_hot = false;
-                        rc = pqueue_insert(bp->cold_pool, entry);
-                        ftl_assert(rc == 0);
-                        rc = pqueue_insert(bp->cold_pool_eff, entry);
-                        ftl_assert(rc == 0);
+                        ftl_assert(pqueue_insert(bp->cold_pool, entry) == 0);
+                        ftl_assert(pqueue_insert(bp->cold_pool_eff, entry) == 0);
                     }
                 }
             }
