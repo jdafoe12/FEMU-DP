@@ -1,7 +1,9 @@
+//#define FEMU_DEBUG_FTL
+
 #include "ftl.h"
 #include "dp.h"
 
-#define FEMU_DEBUG_FTL
+
 
 static void *ftl_thread(void *arg);
 
@@ -725,7 +727,7 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
 
 void dp_perform_wear_leveling(struct ssd *ssd)
 {
-    ftl_debug("Performing wear leveling...\n");
+    //ftl_debug("Performing wear leveling...\n");
     struct block_pools *bp = &ssd->bp;
     dp_pool_entry *hot_entry;
     dp_pool_entry *cold_entry;
