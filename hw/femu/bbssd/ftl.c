@@ -1,4 +1,5 @@
 #include "ftl.h"
+#include "dp.h"
 
 //#define FEMU_DEBUG_FTL
 
@@ -87,7 +88,8 @@ static void ssd_init_lines(struct ssd *ssd)
     struct line_mgmt *lm = &ssd->lm;
     struct line *line;
 
-    lm->tt_lines = spp->blks_per_pl;
+    lm->tt_lines = spp->blks_per_pl; // this is the number of lines. 
+                                     // The lines each consist of a block from each plane in all channels.
     ftl_assert(lm->tt_lines == spp->tt_lines);
     lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
 
@@ -346,7 +348,7 @@ static void ssd_init_maptbl(struct ssd *ssd)
 
     ssd->maptbl = g_malloc0(sizeof(struct ppa) * spp->tt_pgs);
     for (int i = 0; i < spp->tt_pgs; i++) {
-        ssd->maptbl[i].ppa = UNMAPPED_PPA;
+        ssd->maptbl[i].ppa = UNMAPPED_PPA; // each index in the maptbl is a a logical page number (lpn).
     }
 }
 
@@ -381,8 +383,14 @@ void ssd_init(FemuCtrl *n)
     /* initialize rmap */
     ssd_init_rmap(ssd);
 
+    /* default threshold for wear-leveling */
+    ssd->th = 50;
+
     /* initialize all the lines */
     ssd_init_lines(ssd);
+
+    /* initialize block pools for wear-leveling decisions */
+    dp_init_block_pools(ssd);
 
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
@@ -458,13 +466,13 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
 {
     int c = ncmd->cmd;
     uint64_t cmd_stime = (ncmd->stime == 0) ? \
-        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;
-    uint64_t nand_stime;
-    struct ssdparams *spp = &ssd->sp;
-    struct nand_lun *lun = get_lun(ssd, ppa);
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime; 
+    uint64_t nand_stime; 
+    struct ssdparams *spp = &ssd->sp; 
+    struct nand_lun *lun = get_lun(ssd, ppa); // get the NAND logical unit (lun) for the physical page address (ppa).
     uint64_t lat = 0;
 
-    switch (c) {
+    switch (c) { // perform the read, write, or erase operation.
     case NAND_READ:
         /* read: perform NAND cmd first */
         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
@@ -599,6 +607,10 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     struct ssdparams *spp = &ssd->sp;
     struct nand_block *blk = get_blk(ssd, ppa);
     struct nand_page *pg = NULL;
+    struct ppa base = *ppa;
+
+    base.g.pg = 0;
+    base.g.sec = 0;
 
     for (int i = 0; i < spp->pgs_per_blk; i++) {
         /* reset page status */
@@ -612,6 +624,7 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     blk->ipc = 0;
     blk->vpc = 0;
     blk->erase_cnt++;
+    dp_update_block_pools(ssd, blk, &base);
 }
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
@@ -710,6 +723,112 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
     ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
 }
 
+void dp_perform_wear_leveling(struct ssd *ssd)
+{
+    struct block_pools *bp = &ssd->bp;
+    dp_pool_entry *hot_entry;
+    dp_pool_entry *cold_entry;
+    dp_pool_entry *hot_tail_entry;
+    struct nand_block *hot;
+    struct nand_block *cold;
+    struct ppa hot_ppa;
+    struct ppa cold_ppa;
+    struct ssdparams *spp = &ssd->sp;
+
+    if (!bp->hot_pool || !bp->cold_pool) {
+        return;
+    }
+
+    if (ssd->th <= 0) {
+        return;
+    }
+
+    hot_entry = dp_peek_entry(bp->hot_pool);
+    cold_entry = dp_peek_tail(bp->cold_pool);
+
+    if (!hot_entry || !cold_entry || hot_entry == cold_entry) {
+        return;
+    }
+
+    hot = hot_entry->blk;
+    cold = cold_entry->blk;
+
+    if (!hot || !cold) {
+        return;
+    }
+
+    if ((hot->erase_cnt - cold->erase_cnt) <= ssd->th) {
+        return;
+    }
+
+    hot_ppa = hot_entry->base;
+    cold_ppa = cold_entry->base;
+
+    /* 1) migrate live pages out of the hot block */
+    clean_one_block(ssd, &hot_ppa);
+
+    /* 2) erase the hot block */
+    mark_block_free(ssd, &hot_ppa);
+
+    /* 3) copy live pages from the cold block into the hot block */
+    for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
+        struct ppa cold_page = cold_ppa;
+        cold_page.g.pg = pg;
+        struct nand_page *page = get_pg(ssd, &cold_page);
+
+        if (page->status != PG_VALID) {
+            continue;
+        }
+
+        uint64_t lpn = get_rmap_ent(ssd, &cold_page);
+        if (!valid_lpn(ssd, lpn)) {
+            continue;
+        }
+
+        struct ppa hot_page = hot_ppa;
+        hot_page.g.pg = pg;
+
+        /* simulate NAND read of the cold page */
+        gc_read_page(ssd, &cold_page);
+
+        mark_page_invalid(ssd, &cold_page);
+        set_rmap_ent(ssd, INVALID_LPN, &cold_page);
+
+        set_maptbl_ent(ssd, lpn, &hot_page);
+        set_rmap_ent(ssd, lpn, &hot_page);
+        mark_page_valid(ssd, &hot_page);
+
+        /* simulate NAND program into the hot block */
+        gc_write_page(ssd, &hot_page);
+    }
+
+    /* 4) erase the cold block */
+    mark_block_free(ssd, &cold_ppa);
+
+    /* 5) swap pool association */
+    dp_switch_pool_membership(bp, hot_entry, false);
+    dp_switch_pool_membership(bp, cold_entry, true);
+
+    /* 6) reset effective erase count */
+    dp_reset_effective_ec(bp, hot_entry);
+    dp_reset_effective_ec(bp, cold_entry);
+
+    /* Hot pool resize: move coldest hot entry to cold pool if gap > 2*th */
+    hot_entry = dp_peek_entry(bp->hot_pool);
+    if (!hot_entry) {
+        return;
+    }
+    hot = hot_entry->blk;
+
+    hot_tail_entry = dp_peek_tail(bp->hot_pool);
+    if (hot_tail_entry && hot_tail_entry->blk) {
+        struct nand_block *tail_blk = hot_tail_entry->blk;
+        if ((hot->erase_cnt - tail_blk->erase_cnt) > 2 * ssd->th) {
+            dp_switch_pool_membership(bp, hot_tail_entry, false);
+        }
+    }
+}
+
 static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
 {
     struct line_mgmt *lm = &ssd->lm;
@@ -770,11 +889,11 @@ static int do_gc(struct ssd *ssd, bool force)
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
-    uint64_t lba = req->slba;
-    int nsecs = req->nlb;
+    uint64_t lba = req->slba; // starting logical block address.
+    int nsecs = req->nlb; // number of logical sectors to read.
     struct ppa ppa;
-    uint64_t start_lpn = lba / spp->secs_per_pg;
-    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+    uint64_t start_lpn = lba / spp->secs_per_pg; // starting logical page number.
+    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg; // ending logical page number.
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
 
@@ -784,8 +903,8 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
-        if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
+        ppa = get_maptbl_ent(ssd, lpn); // get the physical page address (ppa) for the logical page number (lpn).
+        if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) { // check if the page is mapped and valid.
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
             //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
@@ -796,7 +915,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         srd.type = USER_IO;
         srd.cmd = NAND_READ;
         srd.stime = req->stime;
-        sublat = ssd_advance_status(ssd, &ppa, &srd);
+        sublat = ssd_advance_status(ssd, &ppa, &srd); // perform the read operation?
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
 
@@ -805,21 +924,21 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
 static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
-    uint64_t lba = req->slba;
+    uint64_t lba = req->slba; // starting logical block address.
     struct ssdparams *spp = &ssd->sp;
-    int len = req->nlb;
-    uint64_t start_lpn = lba / spp->secs_per_pg;
-    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
-    struct ppa ppa;
-    uint64_t lpn;
-    uint64_t curlat = 0, maxlat = 0;
+    int len = req->nlb; // number of logical sectors to write.
+    uint64_t start_lpn = lba / spp->secs_per_pg; // starting logical page number.
+    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg; // ending logical page number.
+    struct ppa ppa; // physical page address.
+    uint64_t lpn; // logical page number.
+    uint64_t curlat = 0, maxlat = 0; // current and maximum latency.
     int r;
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-    while (should_gc_high(ssd)) {
+    while (should_gc_high(ssd)) { // perform GC over a line if needed?
         /* perform GC here until !should_gc(ssd) */
         r = do_gc(ssd, true);
         if (r == -1)
@@ -828,33 +947,36 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ssd, lpn);
-        if (mapped_ppa(&ppa)) {
+        if (mapped_ppa(&ppa)) { // check if the page is mapped.
             /* update old page information first */
-            mark_page_invalid(ssd, &ppa);
-            set_rmap_ent(ssd, INVALID_LPN, &ppa);
+            mark_page_invalid(ssd, &ppa); // mark the page as invalid.
+            set_rmap_ent(ssd, INVALID_LPN, &ppa); // set the reverse mapping to invalid.
         }
 
         /* new write */
         ppa = get_new_page(ssd);
         /* update maptbl */
-        set_maptbl_ent(ssd, lpn, &ppa);
+        set_maptbl_ent(ssd, lpn, &ppa); // update the mapping table.
         /* update rmap */
-        set_rmap_ent(ssd, lpn, &ppa);
+        set_rmap_ent(ssd, lpn, &ppa); // update the reverse mapping.
 
-        mark_page_valid(ssd, &ppa);
+        mark_page_valid(ssd, &ppa); // mark the page as valid.
 
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
+        ssd_advance_write_pointer(ssd); // advance the write pointer.
 
         struct nand_cmd swr;
         swr.type = USER_IO;
         swr.cmd = NAND_WRITE;
         swr.stime = req->stime;
         /* get latency statistics */
-        curlat = ssd_advance_status(ssd, &ppa, &swr);
+        curlat = ssd_advance_status(ssd, &ppa, &swr); 
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
 
+    dp_perform_wear_leveling(ssd);
+    dp_check_cold_pool_resize(ssd);
+    
     return maxlat;
 }
 
@@ -955,8 +1077,8 @@ static void *ftl_thread(void *arg)
     }
 
     /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
-    ssd->to_ftl = n->to_ftl;
-    ssd->to_poller = n->to_poller;
+    ssd->to_ftl = n->to_ftl; // these are passed from the NVMe IO thread to the FTL thread.
+    ssd->to_poller = n->to_poller; // these are passed from the FTL thread to the poller thread.
 
     while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {
@@ -976,7 +1098,7 @@ static void *ftl_thread(void *arg)
             case NVME_CMD_READ:
                 lat = ssd_read(ssd, req);
                 break;
-            case NVME_CMD_DSM:
+            case NVME_CMD_DSM: // should deallocate given logical pages?
                 if (req->dsm_ranges && req->dsm_nr_ranges > 0) {
                     lat = ssd_trim(ssd, req);
                 }
@@ -989,13 +1111,14 @@ static void *ftl_thread(void *arg)
             req->reqlat = lat;
             req->expire_time += lat;
 
-            rc = femu_ring_enqueue(ssd->to_poller[i], (void *)&req, 1);
+            rc = femu_ring_enqueue(ssd->to_poller[i], (void *)&req, 1); // FTL tells the poller
+                                                                        // the details of what to do.
             if (rc != 1) {
                 ftl_err("FTL to_poller enqueue failed\n");
             }
 
             /* clean one line if needed (in the background) */
-            if (should_gc(ssd)) {
+            if (should_gc(ssd)) { // perform GC over a line if needed?
                 do_gc(ssd, false);
             }
         }

@@ -86,6 +86,15 @@ struct nand_block {
     int wp; /* current write pointer */
 };
 
+typedef struct dp_pool_entry {
+    struct nand_block *blk;
+    struct ppa base;
+    uint32_t effective_ec;
+    size_t wear_pos;
+    size_t eff_pos;
+    bool in_hot;
+} dp_pool_entry;
+
 struct nand_plane {
     struct nand_block *blk;
     int nblks;
@@ -188,6 +197,15 @@ struct line_mgmt {
     int full_line_cnt;
 };
 
+struct block_pools {
+    pqueue_t *cold_pool;
+    pqueue_t *hot_pool;
+    pqueue_t *cold_pool_eff;
+    pqueue_t *hot_pool_eff;
+    dp_pool_entry *entries;
+    size_t entry_count;
+};
+
 struct nand_cmd {
     int type;
     int cmd;
@@ -202,6 +220,8 @@ struct ssd {
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
+    struct block_pools bp;
+    int th; // threshold for dp-based wear-leveling.
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
